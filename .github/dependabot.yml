@@ -1,0 +1,16 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    # SHA-pinning policy (§6.1 SEC-M-INFRA-01): every `uses:` in
+    # .github/workflows/*.yml is pinned to a commit SHA with a trailing
+    # `# vX` comment. Dependabot recognises the comment and bumps both
+    # the SHA and the version comment in sync on new releases.
+    # Reference: https://docs.github.com/en/code-security/dependabot/working-with-dependabot/keeping-your-actions-up-to-date-with-dependabot
+    groups:
+      github-actions:
+        patterns:
+          - "*"

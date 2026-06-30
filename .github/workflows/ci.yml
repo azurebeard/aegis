@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  bicep-build:
+    name: Bicep build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
+      - name: Azure CLI login-less Bicep build
+        run: |
+          az bicep install
+          az bicep build --file infra/main.bicep
+          az bicep build-params --file infra/main.bicepparam
+
+  pre-commit:
+    name: pre-commit (gitleaks, etc.)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: '3.12'
+      - name: Run pre-commit
+        # SKIP excludes the npm-dependent `local` hooks (api/web
+        # typecheck/lint/format). Those would need `npm ci` in this job
+        # to find eslint/prettier/tsc — duplicating the work already
+        # done in the dedicated `api`, `web`, and `markdown-lint` jobs
+        # that do install deps. The local hooks are designed for
+        # commit-time enforcement on developer machines, where deps
+        # already exist via `npm install`. The CI's pre-commit job
+        # exists to gate hooks that DON'T have a dedicated CI job
+        # (gitleaks — no equivalent dedicated job; markdownlint runs
+        # here too as a redundant safety net, then again in
+        # `markdown-lint`).
+        env:
+          SKIP: api-typecheck,api-lint,web-typecheck,web-lint,web-format
+        uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd  # v3.0.1
+
+  markdown-lint:
+    name: Markdown lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
+      - name: Lint markdown
+        uses: DavidAnson/markdownlint-cli2-action@ded1f9488f68a970bc66ea5619e13e9b52e601cd  # v23
+        with:
+          config: '.markdownlint.json'
+          globs: |
+            **/*.md
+            !LICENSE
+            !NOTICE
+
+  api:
+    name: api — lint, typecheck, test, build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: api/package-lock.json
+      - name: Install
+        run: npm ci --no-audit --no-fund
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test
+      - name: Build
+        run: npm run build
+
+  web:
+    name: web — lint, format, typecheck, test, build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install
+        run: npm ci --no-audit --no-fund
+      - name: Lint
+        run: npm run lint
+      - name: Format check
+        run: npm run format
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test
+      - name: Build
+        env:
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID || 'organizations' }}
+        run: npm run build
