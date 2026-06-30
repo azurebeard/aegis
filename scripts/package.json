@@ -1,0 +1,14 @@
+{
+  "name": "@aegis/scripts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "One-off operational scripts for XDR Hub (aegis). Kept alongside the source tree so ADR-0015 / ADR-0014 invariants stay runnable without a compiled bundle.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "dependencies": {
+    "@azure/data-tables": "^13.3.2",
+    "@azure/identity": "^4.13.1",
+    "@azure/storage-blob": "^12.31.0",
+    "json-canonicalize": "^1.2.0"
+  }
+}

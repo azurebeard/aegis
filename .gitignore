@@ -1,0 +1,57 @@
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# azd packaging artifacts that occasionally land in the repo root
+# (per-run app zips named `<guid>-app.zip`).
+*-app.zip
+
+# IDE / editors
+.vscode/
+.idea/
+*.sublime-*
+*.swp
+
+# PowerShell / Bicep runtime
+*.log
+*.tmp
+bin/
+obj/
+
+# Bicep compiled ARM output — not committed; regenerated on build
+infra/main.json
+infra/**/*.json
+!infra/**/*.bicepparam
+!infra/main.parameters.json
+
+# azd per-environment state — machine-local, not committed
+.azure/
+
+# Node build artefacts
+**/node_modules/
+**/dist/
+api/dist/
+web/dist/
+
+# Web — generated SWA config (template is the source of truth)
+web/public/staticwebapp.config.json
+
+# Local Functions runtime state
+api/local.settings.json
+
+# TypeScript incremental build info
+**/*.tsbuildinfo
+
+# Serena (per-project memory, local only)
+.serena/
+
+# Secrets (defence in depth)
+.env
+.env.*
+*.key
+*.pfx
+*.pem
+*.p12
+credentials.json
+secrets.json
