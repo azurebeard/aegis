@@ -1,0 +1,22 @@
+# Gitignore-style patterns. Bare names (e.g. `src`) match ANYWHERE in the tree —
+# that is what broke step-3 deploys: `src` excluded `node_modules/fast-xml-parser/src/`
+# too, zeroing out @azure/data-tables' fast-xml-parser ESM import at runtime
+# and causing `0 functions loaded` on the Functions host.
+#
+# Rule: only root-anchored (/foo) or directory-scoped (foo/) patterns here.
+# Never exclude bare file-globs that could match inside node_modules/**.
+
+# Repo-local build and dev artefacts that the Functions host never needs at runtime.
+/src/
+/tests/
+/.git/
+/.vscode/
+/tsconfig.json
+/eslint.config.mjs
+/eslint.config.js
+/.eslintrc*
+/vitest.config.ts
+/vitest.config.js
+/vitest.config.mjs
+/local.settings.json
+/dist/**/*.js.map

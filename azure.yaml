@@ -1,0 +1,435 @@
+# azure.yaml — azd configuration for XDR Hub (codename: aegis)
+# Step 1 foundations: no code services yet. Services are added as Functions/SWA land.
+# Ref: https://learn.microsoft.com/azure/developer/azure-developer-cli/azd-schema
+name: aegis
+metadata:
+  template: aegis@0.0.1
+infra:
+  provider: bicep
+  path: infra
+  module: main
+services:
+  api:
+    project: ./api
+    language: ts
+    host: function
+  web:
+    project: ./web
+    language: ts
+    dist: dist
+    host: staticwebapp
+hooks:
+  preprovision:
+    posix:
+      shell: sh
+      continueOnError: false
+      interactive: false
+      run: |
+        set -eu
+
+        # ------------------------------------------------------------------
+        # First-deploy UX (HANDOVER §6.3 — install-friction sweep
+        # 2026-06-29). Auto-detect / prompt for the four env vars
+        # `main.bicepparam` reads. Without this the deploy fails ~30s into
+        # provision with an opaque "missing required parameter" message.
+        # Each var has the same safety profile: auto-derive when we can,
+        # require explicit value in prod (refusing to guess where a wrong
+        # guess would land you in the wrong tenant / wrong admin user).
+        # ------------------------------------------------------------------
+
+        # ENV / region defaults — auto-detect only outside prod. The prod
+        # env name is the only signal `main.bicep` uses to flip retention /
+        # WORM / resource locks / KV purge protection, so auto-guessing is
+        # safe everywhere it isn't `prod`.
+        if [ -z "${AZURE_TENANT_ID:-}" ]; then
+          DETECTED_TENANT=$(az account show --query tenantId -o tsv 2>/dev/null || echo "")
+          if [ -n "$DETECTED_TENANT" ]; then
+            echo "[preprovision] auto-detected AZURE_TENANT_ID=$DETECTED_TENANT from az session."
+            azd env set AZURE_TENANT_ID "$DETECTED_TENANT" --no-prompt
+            export AZURE_TENANT_ID="$DETECTED_TENANT"
+          else
+            echo "[preprovision] ERROR: AZURE_TENANT_ID not set and az session unavailable." >&2
+            echo "[preprovision]        Run 'az login' then 'azd env set AZURE_TENANT_ID <guid>'." >&2
+            exit 1
+          fi
+        fi
+
+        if [ -z "${AZURE_REGION_SHORT:-}" ]; then
+          # Default 'weu' for new dev envs. Operators on UK South / East US
+          # etc. should set explicitly via `azd env set AZURE_REGION_SHORT`.
+          echo "[preprovision] AZURE_REGION_SHORT not set; defaulting to 'weu'."
+          azd env set AZURE_REGION_SHORT weu --no-prompt
+          export AZURE_REGION_SHORT="weu"
+        fi
+
+        # AZURE_ADMIN_EMAIL — drives the bootstrap admin App Role
+        # assignment. The bootstrap script already assigns admin to whoever
+        # this resolves to; the friction was operators not realising they
+        # need to set their OWN email here. Auto-derive from the deployer's
+        # az session — in 95% of cases the operator IS the intended admin.
+        #
+        # Safety: prod never auto-derives — too easy to deploy from the
+        # wrong account and seed an admin you didn't mean to.
+        if [ -z "${AZURE_ADMIN_EMAIL:-}" ]; then
+          if [ "${AZURE_ENV_NAME:-dev}" = "prod" ]; then
+            echo "[preprovision] ERROR: AZURE_ADMIN_EMAIL is REQUIRED for env=prod and was not set." >&2
+            echo "[preprovision]        Auto-derive is disabled in prod to avoid seeding an admin from the wrong session." >&2
+            echo "[preprovision]        Run 'azd env set AZURE_ADMIN_EMAIL <operator@email>' explicitly." >&2
+            exit 1
+          fi
+          SIGNED_IN_UPN=$(az ad signed-in-user show --query userPrincipalName -o tsv 2>/dev/null || echo "")
+          SIGNED_IN_MAIL=$(az ad signed-in-user show --query mail -o tsv 2>/dev/null || echo "")
+          # Prefer 'mail' when populated — it's the canonical reachable
+          # address; UPN may be a vanity SAML mapping or onmicrosoft.com.
+          # When mail is empty (B2B guest, some account shapes), UPN is the
+          # only thing we have.
+          CANDIDATE_EMAIL="${SIGNED_IN_MAIL:-$SIGNED_IN_UPN}"
+          if [ -z "$CANDIDATE_EMAIL" ]; then
+            echo "[preprovision] ERROR: AZURE_ADMIN_EMAIL not set and az signed-in-user is not a User principal" >&2
+            echo "[preprovision]        (likely a ServicePrincipal context — CI?). Set explicitly:" >&2
+            echo "[preprovision]        azd env set AZURE_ADMIN_EMAIL <operator@email>" >&2
+            exit 1
+          fi
+          echo "[preprovision] auto-detected AZURE_ADMIN_EMAIL=$CANDIDATE_EMAIL — you will be assigned the 'admin' App Role on first bootstrap."
+          azd env set AZURE_ADMIN_EMAIL "$CANDIDATE_EMAIL" --no-prompt
+          export AZURE_ADMIN_EMAIL="$CANDIDATE_EMAIL"
+          # When mail and UPN diverge (external-email case: mail is a
+          # vanity address, UPN is the real directory identity), also
+          # set AZURE_ADMIN_UPN so bootstrap's directory lookup uses the
+          # authoritative UPN. Closes HANDOVER §10.1 task (a) automatically.
+          if [ -n "$SIGNED_IN_UPN" ] && [ "$SIGNED_IN_UPN" != "$CANDIDATE_EMAIL" ] && [ -z "${AZURE_ADMIN_UPN:-}" ]; then
+            echo "[preprovision] also setting AZURE_ADMIN_UPN=$SIGNED_IN_UPN (mail and UPN differ — UPN is the authoritative directory key)."
+            azd env set AZURE_ADMIN_UPN "$SIGNED_IN_UPN" --no-prompt
+            export AZURE_ADMIN_UPN="$SIGNED_IN_UPN"
+          fi
+        fi
+
+        # F-fwd-1 (docs/prod-tier-dryrun-lessons-learned.md §3) — provider
+        # preflight. Fresh subscriptions miss one or more of these and the
+        # symptoms are opaque (AuthorizationFailed on a ServiceAssociationLink
+        # call, 502 in the Portal deploy view) ~10 min into provision.
+        # `Microsoft.App` is the addition vs the historical 9-provider list:
+        # Flex Consumption VNet integration delegates `snet-func` to
+        # `Microsoft.App/environments`, so the RP must be registered before
+        # the VNet integration call.
+        # Idempotent: `register --wait` is a no-op on already-registered
+        # namespaces. ~5-10 s on a warm sub, ~30 s per missing provider on a
+        # fresh one. Runs against the azd-supplied subscription (env var
+        # always set by the azd hook context).
+        echo "[preprovision] F-fwd-1 provider preflight — checking 10 namespaces against subscription ${AZURE_SUBSCRIPTION_ID}."
+        for ns in Microsoft.App \
+                  Microsoft.Web \
+                  Microsoft.Storage \
+                  Microsoft.KeyVault \
+                  Microsoft.CognitiveServices \
+                  Microsoft.Network \
+                  Microsoft.OperationalInsights \
+                  Microsoft.Insights \
+                  Microsoft.ManagedIdentity \
+                  Microsoft.Authorization; do
+          STATE=$(az provider show \
+            --namespace "$ns" \
+            --subscription "${AZURE_SUBSCRIPTION_ID}" \
+            --query registrationState -o tsv 2>/dev/null || echo "Unknown")
+          if [ "$STATE" != "Registered" ]; then
+            echo "[preprovision] Registering $ns (was: $STATE)…"
+            az provider register \
+              --namespace "$ns" \
+              --subscription "${AZURE_SUBSCRIPTION_ID}" \
+              --wait
+            echo "[preprovision] $ns → Registered."
+          else
+            echo "[preprovision] $ns: already Registered."
+          fi
+        done
+        echo "[preprovision] Provider preflight complete."
+    windows:
+      shell: pwsh
+      continueOnError: false
+      interactive: false
+      run: |
+        $ErrorActionPreference = 'Stop'
+        Write-Host "[preprovision] F-fwd-1 provider preflight — checking 10 namespaces against subscription $env:AZURE_SUBSCRIPTION_ID."
+        $providers = @(
+          'Microsoft.App',
+          'Microsoft.Web',
+          'Microsoft.Storage',
+          'Microsoft.KeyVault',
+          'Microsoft.CognitiveServices',
+          'Microsoft.Network',
+          'Microsoft.OperationalInsights',
+          'Microsoft.Insights',
+          'Microsoft.ManagedIdentity',
+          'Microsoft.Authorization'
+        )
+        foreach ($ns in $providers) {
+          $state = (& az provider show --namespace $ns --subscription $env:AZURE_SUBSCRIPTION_ID --query registrationState -o tsv 2>$null)
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($state)) { $state = 'Unknown' }
+          if ($state -ne 'Registered') {
+            Write-Host "[preprovision] Registering $ns (was: $state)…"
+            & az provider register --namespace $ns --subscription $env:AZURE_SUBSCRIPTION_ID --wait
+            if ($LASTEXITCODE -ne 0) { throw "Failed to register $ns (az exit $LASTEXITCODE)" }
+            Write-Host "[preprovision] $ns -> Registered."
+          } else {
+            Write-Host "[preprovision] $ns: already Registered."
+          }
+        }
+        Write-Host "[preprovision] Provider preflight complete."
+  postprovision:
+    posix:
+      shell: sh
+      continueOnError: false
+      interactive: true
+      run: |
+        set -eu
+
+        echo "[postprovision] 1/4 Bootstrapping Entra ID app registration + Graph app-role grant to ingest MI (interactive Graph login may open)."
+        # pwsh -File is interactive by default when a TTY is attached; we rely on
+        # azd's hook interactive=true. Do NOT pass -NonInteractive:$false — `sh`
+        # expands $false before pwsh sees it and set -u aborts on the unset var.
+        # Step 3: pass ingest MI object ID + Function App coordinates so the script:
+        #   (a) grants SecurityEvents.Read.All to the ingest MI (ADR-0010 §4), and
+        #   (b) restarts the Function App on actioned grants so the IMDS MI token
+        #       cache sees the new role (closes SEC-M-ADR-10-01 race).
+        # -AdminUpn is optional: when AZURE_ADMIN_UPN is set, the script uses the
+        # UPN for the tenant directory lookup (external-email case — HANDOVER
+        # §10.1 a). When unset, bootstrap falls back to the -AdminEmail flow.
+        # -RequireAdminUserResolved defaults ON for prod and OFF for dev/test.
+        # Explicit AZURE_REQUIRE_ADMIN_USER_RESOLVED=true|false overrides the
+        # env-based default. Converts "admin user unresolved" warning into a
+        # hard failure so a typo in UPN can't silently ship a deployment
+        # without the admin App Role (WS10 OBS-3.1 follow-up to Option D #3).
+        REQUIRE_ADMIN_FLAG=""
+        REQUIRE_ADMIN="${AZURE_REQUIRE_ADMIN_USER_RESOLVED:-}"
+        if [ -z "$REQUIRE_ADMIN" ] && [ "${AZURE_ENV_NAME:-}" = "prod" ]; then
+          REQUIRE_ADMIN="true"
+        fi
+        if [ "$REQUIRE_ADMIN" = "true" ]; then
+          REQUIRE_ADMIN_FLAG="-RequireAdminUserResolved"
+        fi
+        # ADR-0030 Phase C — optional mail-sender wiring. Operator sets
+        # `AZURE_MAIL_SENDER_UPN` to a mailbox UPN (shared or licensed) to
+        # opt in. `AZURE_MAIL_SENDER_REQUIRED` is a tri-state: `true` =
+        # explicit hard-fail; `false` = explicit soft-skip; unset = env-aware
+        # default (prod → required; dev/test → optional). The script
+        # validates the value against {''|'true'|'false'} — any other
+        # value fails ValidateSet at the param boundary.
+        BOOTSTRAP_JSON=$(pwsh -NoProfile -File ./scripts/bootstrap-entra.ps1 \
+          -Env "${AZURE_ENV_NAME}" \
+          -TenantId "${AZURE_TENANT_ID}" \
+          -AdminEmail "${AZURE_ADMIN_EMAIL}" \
+          -AdminUpn "${AZURE_ADMIN_UPN:-}" \
+          -SwaHostname "${SWA_DEFAULT_HOSTNAME}" \
+          -IngestMiObjectId "${INGEST_MI_PRINCIPAL_ID}" \
+          -MailSenderMiObjectId "${MAIL_SENDER_MI_PRINCIPAL_ID:-}" \
+          -MailSenderUpn "${AZURE_MAIL_SENDER_UPN:-}" \
+          -MailSenderRequired "${AZURE_MAIL_SENDER_REQUIRED:-}" \
+          -FunctionAppName "${FUNCTION_APP_NAME}" \
+          -ResourceGroupName "${AZURE_RESOURCE_GROUP_NAME}" \
+          -SubscriptionId "${AZURE_SUBSCRIPTION_ID}" \
+          ${REQUIRE_ADMIN_FLAG} \
+          | tail -n 200)
+        # §10.72 — legacy `.appId` field dropped from bootstrap summary.
+        # `nativeAuth.apiAppId` is the canonical "did bootstrap succeed"
+        # signal post-Phase E. Mirrors the AAD_CLIENT_ID / SWA_MI_APP_ID
+        # pitfall §6.2.24 pattern.
+        AEGIS_API_APP_ID=$(echo "$BOOTSTRAP_JSON" | jq -r '.nativeAuth.apiAppId // empty')
+        AEGIS_SPA_APP_ID=$(echo "$BOOTSTRAP_JSON" | jq -r '.nativeAuth.spaAppId // empty')
+
+        # DEFENSE-STEP3-INFRA-01 — Graph scope drift observability (§6.1).
+        # `Grant-GraphAppRolesToMi` surfaces any Graph app-role assignments
+        # on the ingest MI that aren't in the declared `RequiredGraphScopes`
+        # list as `status="drift_extra"` records inside `graphGrantResults`.
+        # Until 2026-06-25 these only landed in the bootstrap summary JSON,
+        # observable only by an operator reading the deploy output. Now we:
+        #   1. Surface drift LOUDLY at deploy time (operator can't miss it).
+        #   2. Emit an `AIEVENT.GraphScopeDrift` text marker on stdout in the
+        #      same shape the api/src/lib/aievent.ts wrapper writes — a
+        #      future Log Analytics rule on FunctionAppLogs can lift the
+        #      same shape if the postprovision logs are forwarded, or an
+        #      operator can grep the deploy output for the marker.
+        #   3. Persist the count + scope list as azd env vars so a follow-up
+        #      query (`azd env get-values | grep DRIFT`) surfaces the
+        #      most-recent deploy's drift state without re-running bootstrap.
+        # Non-blocking — drift is an observation, not a deploy failure.
+        # Remediation is operator-driven (revoke via az, or run bootstrap
+        # with -RevokeGraphGrants once the deny-list is confirmed).
+        DRIFT_EXTRA_COUNT=$(echo "$BOOTSTRAP_JSON" | jq -r '[.graphGrantResults[]? | select(.status == "drift_extra")] | length' 2>/dev/null || echo "0")
+        if [ "${DRIFT_EXTRA_COUNT:-0}" -gt 0 ]; then
+          DRIFT_EXTRA_SCOPES=$(echo "$BOOTSTRAP_JSON" | jq -r '[.graphGrantResults[]? | select(.status == "drift_extra") | .scope] | join(",")' 2>/dev/null)
+          echo "[postprovision] WARNING: Graph scope drift detected on ingest MI — ${DRIFT_EXTRA_COUNT} extra grant(s) not in declared scope list." >&2
+          echo "[postprovision]          Scopes: ${DRIFT_EXTRA_SCOPES}" >&2
+          echo "[postprovision]          Remediation: review via Entra portal, or run bootstrap-entra.ps1 with -RevokeGraphGrants after WS10 sign-off." >&2
+          echo "[postprovision] AIEVENT GraphScopeDrift {\"driftCount\":${DRIFT_EXTRA_COUNT},\"driftScopes\":\"${DRIFT_EXTRA_SCOPES}\",\"tenantId\":\"${AZURE_TENANT_ID}\",\"source\":\"azd_postprovision\"}"
+          azd env set LAST_DEPLOY_GRAPH_DRIFT_COUNT "${DRIFT_EXTRA_COUNT}" --no-prompt
+          azd env set LAST_DEPLOY_GRAPH_DRIFT_SCOPES "${DRIFT_EXTRA_SCOPES}" --no-prompt
+        else
+          echo "[postprovision] Graph scope hygiene: no drift on ingest MI (declared scope list matches granted)."
+          # Clear stale env vars from prior deploys so a fixed state is observable.
+          azd env set LAST_DEPLOY_GRAPH_DRIFT_COUNT "0" --no-prompt
+          azd env set LAST_DEPLOY_GRAPH_DRIFT_SCOPES "" --no-prompt
+        fi
+
+        if [ -z "$AEGIS_API_APP_ID" ] || [ "$AEGIS_API_APP_ID" = "null" ]; then
+          echo "[postprovision] ERROR: bootstrap-entra.ps1 did not return nativeAuth.apiAppId." >&2
+          exit 1
+        fi
+        echo "[postprovision] Entra API app ID: $AEGIS_API_APP_ID"
+        if [ -n "$AEGIS_API_APP_ID" ] && [ "$AEGIS_API_APP_ID" != "null" ]; then
+          echo "[postprovision] ADR-0035 — persisting AZURE_AEGIS_API_APP_ID=${AEGIS_API_APP_ID} into azd env."
+          azd env set AZURE_AEGIS_API_APP_ID "$AEGIS_API_APP_ID" --no-prompt
+          # Set on the Function App immediately so the in-flight FA picks up
+          # the v2.0 audience without waiting for a follow-up `azd provision`.
+          az functionapp config appsettings set \
+            --name "${FUNCTION_APP_NAME}" \
+            --resource-group "${AZURE_RESOURCE_GROUP_NAME}" \
+            --settings "AEGIS_API_APP_ID=${AEGIS_API_APP_ID}" \
+            --output none
+        else
+          echo "[postprovision] WARNING: bootstrap JSON did not contain nativeAuth.apiAppId — Phase B may not have run, or older bootstrap script in use. Skipping AEGIS_API_APP_ID persist."
+        fi
+        if [ -n "$AEGIS_SPA_APP_ID" ] && [ "$AEGIS_SPA_APP_ID" != "null" ]; then
+          echo "[postprovision] ADR-0035 — persisting AZURE_AEGIS_SPA_APP_ID=${AEGIS_SPA_APP_ID} into azd env (consumed by web build)."
+          azd env set AZURE_AEGIS_SPA_APP_ID "$AEGIS_SPA_APP_ID" --no-prompt
+        else
+          echo "[postprovision] WARNING: bootstrap JSON did not contain nativeAuth.spaAppId — web build will fail at MSAL initialisation."
+        fi
+
+        # §10.66 Phase E — Easy Auth on the FA + SWA-MI runtime binding both
+        # retired. SPA authenticates directly to Entra via MSAL.js (PKCE, no
+        # client secret) and the FA validates the resulting Bearer JWT in
+        # `api/src/lib/authMiddleware.ts`. Network boundary moved to
+        # `siteConfig.ipSecurityRestrictions` in Bicep (Azure West Europe
+        # service tag — WS10 SEC-M-01 risk-accepted option (a)).
+        # §10.72 — legacy AAD_APP_ID guard removed; AEGIS_API_APP_ID guard
+        # above is now the canonical "bootstrap returned an app id" check.
+        : "${AEGIS_API_APP_ID:?}"
+
+        echo "[postprovision] 2/4 Linking SWA → Function App backend (same-origin proxy; SPA's Bearer JWT passes through to FA-side validation)."
+        az staticwebapp backends link \
+          --name "${SWA_NAME}" \
+          --resource-group "${AZURE_RESOURCE_GROUP_NAME}" \
+          --backend-resource-id "${FUNCTION_APP_RESOURCE_ID}" \
+          --backend-region "${AZURE_LOCATION}" \
+          --output none
+
+        echo "[postprovision] 3/4 Audit immutability lock check (prod only)."
+        if [ "${AZURE_ENV_NAME:-}" != "prod" ]; then
+          echo "[postprovision] env=${AZURE_ENV_NAME:-unset}: non-prod — skipping audit immutability lock."
+        else
+          # F1 (docs/prod-tier-dryrun-phase1a-findings.md): the previous
+          # version called `lock` unconditionally, which errored on the
+          # second `azd provision` ("policy is already locked"). Read the
+          # policy state first and short-circuit when already locked so
+          # operator re-provisions (param tweaks, secret rotations, etc.)
+          # are idempotent. The `state` field returns `Unlocked` or
+          # `Locked` (Pascal-case per the Storage REST schema). A missing
+          # policy fails the subsequent ETAG `show` call under `set -e`,
+          # which IS the intended terminate-the-deploy behaviour for the
+          # "Bicep didn't create the policy in prod" case — captured by
+          # the explicit ERROR / `exit 1` branch a few lines down.
+          POLICY_STATE=$(az storage container immutability-policy show \
+            --account-name "${AUDIT_STORAGE_ACCOUNT_NAME}" \
+            --container-name audit \
+            --resource-group "${AZURE_RESOURCE_GROUP_NAME}" \
+            --query state -o tsv 2>/dev/null || true)
+          if [ "${POLICY_STATE}" = "Locked" ]; then
+            echo "[postprovision] immutability policy already locked — skipping (idempotent re-provision)."
+          else
+            ETAG=$(az storage container immutability-policy show \
+              --account-name "${AUDIT_STORAGE_ACCOUNT_NAME}" \
+              --container-name audit \
+              --resource-group "${AZURE_RESOURCE_GROUP_NAME}" \
+              --query etag -o tsv)
+            if [ -z "${ETAG}" ]; then
+              echo "[postprovision] ERROR: immutability policy not found on audit container — Bicep may not have created it in prod." >&2
+              exit 1
+            fi
+            az storage container immutability-policy lock \
+              --account-name "${AUDIT_STORAGE_ACCOUNT_NAME}" \
+              --container-name audit \
+              --resource-group "${AZURE_RESOURCE_GROUP_NAME}" \
+              --if-match "${ETAG}" \
+              --output none
+            echo "[postprovision] immutability policy locked."
+          fi
+        fi
+
+        # Persist the canonical budget startDate (§10.48 hygiene #3 / 35ff043
+        # follow-up). Microsoft.Consumption/budgets has an immutable startDate;
+        # the in-Bicep utcNow('yyyy-MM-01') default re-evaluates on each deploy
+        # and tripped "Start date of budgets cannot be updated" on month
+        # rollover. Reading the live value back and persisting via azd env var
+        # AZURE_BUDGET_START_DATE means subsequent deploys submit the original
+        # creation-month value (no change → no rejection). Idempotent — a
+        # re-run that finds the env var already set just rewrites the same
+        # value.
+        BUDGET_NAME="aegis-monthly-${AZURE_ENV_NAME}"
+        BUDGET_START_DATE=$(az consumption budget show \
+          --budget-name "${BUDGET_NAME}" \
+          --query "timePeriod.startDate" -o tsv 2>/dev/null \
+          | cut -c1-10)
+        if [ -n "${BUDGET_START_DATE}" ]; then
+          echo "[postprovision] Persisting AZURE_BUDGET_START_DATE=${BUDGET_START_DATE} (immutable; future deploys reuse)."
+          azd env set AZURE_BUDGET_START_DATE "${BUDGET_START_DATE}" --no-prompt
+        else
+          echo "[postprovision] WARNING: could not read budget ${BUDGET_NAME} startDate — first deploy may not have created it yet, or az consumption preview API regressed. Future provisions may regenerate startDate and trip the immutable-startDate rejection on month rollover."
+        fi
+
+        # ADR-0030 §C.21 / §C.22 — auto-provision KV secrets that the FA
+        # reads (recipient-hash pepper + share-link signing key). Both
+        # scripts default to -Mode Provision which is idempotent: no-op if
+        # the secret already exists. Generates 32 cryptographically-random
+        # bytes via .NET RandomNumberGenerator + writes via
+        # `az keyvault secret set --file` (temp file scrubbed in finally;
+        # chmod 600 on Linux/macOS before write). FA restart at end of each
+        # script only fires when a NEW version is written, so idempotent
+        # re-runs skip the restart.
+        #
+        # Caller must have Key Vault Secrets Officer on ${KEY_VAULT_NAME}.
+        # The `keyvault.bicep` deployer-grant covers operator + azd-SP cases
+        # when AZURE_DEPLOYER_OBJECT_ID is set in the azd env.
+        #
+        # If the operator wants to opt out (e.g. headless CI deploy that
+        # provisions the secret out-of-band), set AZURE_SKIP_KV_SECRET_PROVISION=true.
+        if [ "${AZURE_SKIP_KV_SECRET_PROVISION:-}" != "true" ]; then
+          echo "[postprovision] 4/5 Provisioning KV secrets (idempotent; no-op if exists; chmod 600 + temp-file write inside the scripts)."
+          # L12-FT-SoT-PS1 (closure) — pass -SecretName from the Bicep
+          # canonical surfaced as azd env vars (`RECIPIENT_HASH_PEPPER_SECRET_NAME`,
+          # `REPORT_SHARE_SIGNING_KEY_SECRET_NAME`). Replaces the
+          # implicit reliance on the PS1 -SecretName defaults — Bicep
+          # is now the single deploy-time source of truth, and a
+          # future drift between Bicep and PS1 defaults is harmless
+          # (the env-passed name wins).
+          pwsh -NoProfile -Command "& ./scripts/provision-recipient-hash-pepper.ps1 -Mode Provision -KeyVaultName '${KEY_VAULT_NAME}' -SecretName '${RECIPIENT_HASH_PEPPER_SECRET_NAME}' -FunctionAppName '${FUNCTION_APP_NAME}' -ResourceGroupName '${AZURE_RESOURCE_GROUP_NAME}'"
+          pwsh -NoProfile -Command "& ./scripts/provision-report-share-signing-key.ps1 -Mode Provision -KeyVaultName '${KEY_VAULT_NAME}' -SecretName '${REPORT_SHARE_SIGNING_KEY_SECRET_NAME}' -FunctionAppName '${FUNCTION_APP_NAME}' -ResourceGroupName '${AZURE_RESOURCE_GROUP_NAME}'"
+        else
+          echo "[postprovision] 4/5 KV-secret auto-provision skipped (AZURE_SKIP_KV_SECRET_PROVISION=true). Operator must run scripts/provision-*-ps1 -Mode Provision manually, or the share-link + peppered-hash features stay default-off (AIEVENT fallback)."
+        fi
+
+        # SEC-OBS-DAAA-04 — when `AZURE_DEPLOY_AI_AGENTS=false`, Azure's
+        # incremental deployment mode leaves the agent-MI role assignments,
+        # Foundry hub, and AgentRun alert in place even though the Bicep
+        # module guards evaluated false. `cleanup-ai-plane.ps1` removes them.
+        # The script self-gates twice: it requires the literal string
+        # "false" AND the explicit -AcceptDataLoss switch, so an accidental
+        # invocation against a healthy AI plane is impossible.
+        #
+        # Data preservation invariant (ADR-0017): the cleanup NEVER touches
+        # the agent MI itself, the tables, or the blob containers it
+        # consumes — a future flip back to true restores RBAC + handler
+        # registration via Bicep with zero data loss.
+        if [ "${AZURE_DEPLOY_AI_AGENTS:-true}" = "false" ]; then
+          echo "[postprovision] 5/5 AI-plane cleanup (deployAiAgents=false; SEC-OBS-DAAA-04)."
+          pwsh -NoProfile -File ./scripts/cleanup-ai-plane.ps1 \
+            -SubscriptionId "${AZURE_SUBSCRIPTION_ID}" \
+            -ResourceGroupName "${AZURE_RESOURCE_GROUP_NAME}" \
+            -Environment "${AZURE_ENV_NAME}" \
+            -RegionShort "${AZURE_REGION_SHORT:-uks}" \
+            -DeployAiAgents "${AZURE_DEPLOY_AI_AGENTS}" \
+            -AcceptDataLoss
+        else
+          echo "[postprovision] 5/5 AI-plane cleanup skipped (deployAiAgents=${AZURE_DEPLOY_AI_AGENTS:-true}; not 'false')."
+        fi
+
+        echo "[postprovision] DONE."

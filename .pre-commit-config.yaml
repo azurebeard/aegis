@@ -1,0 +1,72 @@
+# Pre-commit hooks for aegis.
+#
+# Install once: `pre-commit install` (creates .git/hooks/pre-commit).
+# Run manually:  `pre-commit run --all-files`.
+#
+# Performance note: api + web typecheck/lint are scoped via `files:` patterns
+# so only changed-side hooks fire. Typical commit touches one side → ~3-5s
+# overhead; double-sided commits cost ~10s. Tests are NOT in pre-commit (too
+# slow to run on every commit) — run `npm test` manually or rely on CI.
+
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.0
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      # ---- api side ----
+      - id: api-typecheck
+        name: api typecheck
+        # tsc is fast (~2s) and catches most regressions before they reach a
+        # committed state. Runs once per commit, scans the whole `api/`
+        # package (npm script is project-scoped, not file-scoped).
+        entry: bash -c 'cd api && npm run --silent typecheck'
+        language: system
+        files: ^api/.*\.(ts|json|mjs)$
+        pass_filenames: false
+
+      - id: api-lint
+        name: api lint
+        entry: bash -c 'cd api && npm run --silent lint'
+        language: system
+        files: ^api/.*\.ts$
+        pass_filenames: false
+
+      # ---- web side ----
+      - id: web-typecheck
+        name: web typecheck
+        entry: bash -c 'cd web && npm run --silent typecheck'
+        language: system
+        files: ^web/.*\.(ts|tsx|json|mjs)$
+        pass_filenames: false
+
+      - id: web-lint
+        name: web lint
+        entry: bash -c 'cd web && npm run --silent lint'
+        language: system
+        files: ^web/.*\.(ts|tsx)$
+        pass_filenames: false
+
+      - id: web-format
+        name: web prettier --check
+        # Mirrors `npm run format` (CI gate). The web side runs prettier in
+        # `--check` mode for *.{ts,tsx,css,json}` under `src/`. Skip the
+        # hook on non-web changes via `files:` filter.
+        entry: bash -c 'cd web && npm run --silent format'
+        language: system
+        files: ^web/src/.*\.(ts|tsx|css|json)$
+        pass_filenames: false
+
+  # ---- docs ----
+  - repo: https://github.com/DavidAnson/markdownlint-cli2
+    rev: v0.13.0
+    hooks:
+      - id: markdownlint-cli2
+        # Uses the project-checked-in `.markdownlint.json` config + the
+        # `.markdownlintignore` exclude list. Mirrors the GitHub Actions
+        # `DavidAnson/markdownlint-cli2-action@v23` job locally so markdown
+        # lint failures land at commit time, not in CI. Hook auto-installs
+        # via the upstream repo — no project node_modules dependency.
+        args: ['--config', '.markdownlint.json']

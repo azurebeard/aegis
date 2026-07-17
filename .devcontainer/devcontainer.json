@@ -1,0 +1,119 @@
+// HANDOVER §6.3 — install-friction sweep, 2026-06-29.
+//
+// Codespaces / VS Code Dev Containers config for Project Aegis.
+//
+// Opens the repo in a container with every `azd up` prereq pre-installed:
+//   - node 22 (from the base image; engines pin)
+//   - az CLI (devcontainers/features/azure-cli)
+//   - azd CLI (azure/azure-dev/azd)
+//   - pwsh 7+ (devcontainers/features/powershell)
+//   - the three Microsoft.Graph.* modules bootstrap-entra.ps1 needs
+//     (installed in post-create.sh)
+//   - jq, git, curl (common-utils + base image)
+//   - Azure Functions Core Tools 4.x (post-create.sh; for `npm run start` in api/)
+//
+// New user flow:
+//   1. Click "Open in Codespaces" or use the VS Code Dev Containers
+//      extension locally with this folder open.
+//   2. Wait ~3-5 min for the container to build (Codespaces prebuilds
+//      shorten this on subsequent opens).
+//   3. Terminal opens at /workspaces/aegis with everything
+//      installed. Confirm with `bash scripts/check-prereqs.sh`.
+//   4. `az login` + `azd auth login` (device-code flow opens in a
+//      browser tab — Codespaces handles this cleanly).
+//   5. `bash scripts/install.sh` (the wrapper) OR the explicit path:
+//      `azd env new dev --subscription <subId> --location westeurope`
+//      followed by `azd up`. The preprovision hook auto-detects the
+//      env vars (HANDOVER §4.2).
+//
+// Cost note: Codespaces personal free tier = 60h/month (Pro = 90h).
+// A full first-deploy session is ~30 min. Container build doesn't count
+// against compute hours for public-repo Codespaces prebuilds.
+//
+// Local Dev Containers (no Codespaces): the same config works with the
+// VS Code "Dev Containers" extension and `Dev Containers: Reopen in
+// Container`. Docker Desktop / Podman / orbstack as the runtime.
+{
+  "name": "Project Aegis",
+
+  // Base image — Microsoft's javascript-node devcontainer with Node 22
+  // pinned. Matches engines.node ">=22 <23" in api/web package.json.
+  // Includes git, curl, build-essential, gh CLI. ~1.2 GB.
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:22",
+
+  "features": {
+    // Azure CLI — installs latest from the apt repo. ~150 MB.
+    "ghcr.io/devcontainers/features/azure-cli:1": {
+      "version": "latest"
+    },
+    // Azure Developer CLI — the canonical install path (>= 1.25.6 is
+    // required per HANDOVER §6.2 — earlier versions trip the SWA-deploy
+    // "environment default invalid" bug, fixed in 1.25). The feature
+    // pulls latest stable. ~30 MB.
+    "ghcr.io/azure/azure-dev/azd:latest": {},
+    // PowerShell 7 — required by bootstrap-entra.ps1, the three
+    // provision-*-secret PS1s, and cleanup-ai-plane.ps1. ~200 MB.
+    "ghcr.io/devcontainers/features/powershell:1": {
+      "version": "latest"
+    },
+    // Common utils — jq (postprovision hook needs it), zsh + Oh-My-Zsh
+    // for a friendlier prompt. ~50 MB.
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": "true",
+      "configureZshAsDefaultShell": "false"
+    }
+  },
+
+  // One-time setup that runs after the container is built.
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+
+  // Forward the two local-dev ports so VS Code surfaces them in the
+  // Ports panel. The Functions host runs on 7071 (`cd api && npm run
+  // start`); Vite on 4280 (`cd web && npm run dev`).
+  "forwardPorts": [7071, 4280],
+  "portsAttributes": {
+    "7071": {
+      "label": "Functions API (local)",
+      "onAutoForward": "silent"
+    },
+    "4280": {
+      "label": "SWA / Vite dev",
+      "onAutoForward": "silent"
+    }
+  },
+
+  "customizations": {
+    "vscode": {
+      // Extensions that match the stack. None are required to deploy —
+      // they just make the local dev loop better.
+      "extensions": [
+        "ms-azuretools.vscode-azurefunctions",
+        "ms-azuretools.vscode-bicep",
+        "ms-azuretools.vscode-azure-dev",
+        "ms-azuretools.azure-dev",
+        "ms-vscode.PowerShell",
+        "esbenp.prettier-vscode",
+        "dbaeumer.vscode-eslint",
+        "vitest.explorer"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "esbenp.prettier-vscode",
+        "[powershell]": {
+          "editor.defaultFormatter": "ms-vscode.PowerShell"
+        },
+        "[bicep]": {
+          "editor.defaultFormatter": "ms-azuretools.vscode-bicep"
+        },
+        "files.eol": "\n",
+        "powershell.codeFormatting.preset": "OTBS",
+        "azureFunctions.deploySubpath": "api",
+        "azureFunctions.scmDoBuildDuringDeployment": false
+      }
+    }
+  },
+
+  // Run as the non-root `node` user from the base image. The az / azd /
+  // pwsh features install into shared paths so they're on PATH regardless.
+  "remoteUser": "node"
+}
