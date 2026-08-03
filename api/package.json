@@ -28,7 +28,7 @@
     "@azure/functions": "^4.6.0",
     "@azure/identity": "^4.13.1",
     "@azure/keyvault-secrets": "^4.11.2",
-    "@azure/storage-blob": "^12.31.0",
+    "@azure/storage-blob": "^12.33.0",
     "@microsoft/microsoft-graph-client": "^3.0.7",
     "applicationinsights": "^3.15.1",
     "jose": "^5.10.0",
