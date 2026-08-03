@@ -130,9 +130,34 @@ jobs:
           # covered by CodeQL's `actions` language. --soft-fail keeps findings
           # advisory. Note infra/main.json is bicep build output and untracked,
           # so it is never present in a CI checkout.
+          # Suppressed checks. Each is suppressed because it is WRONG about this
+          # code, not because it is inconvenient. Verified against the source on
+          # 2026-08-03; re-check if storage-audit.bicep changes materially.
+          #
+          #   CKV_AZURE_59  "disallow public access"
+          #                 -> `allowBlobPublicAccess: false` IS set (line 43).
+          #   CKV_AZURE_206 "use replication"
+          #                 -> sku is `Standard_ZRS`, which IS replicated. The
+          #                    check expects geo-redundancy; zone-redundancy is
+          #                    the deliberate choice here.
+          #   CKV_AZURE_43  "adhere to naming rules"
+          #                 -> account name is a parameter; checkov cannot
+          #                    evaluate it statically.
+          #
+          # DELIBERATELY NOT SUPPRESSED: CKV_AZURE_35 (default network action).
+          # That one is correct. `networkAcls.defaultAction` resolves to 'Allow'
+          # whenever AZURE_PRIVATE_ENDPOINTS_ENABLED is false, which is the
+          # default. The perimeter is selectable per deployment, so the finding
+          # stays visible as a standing reminder of the default posture rather
+          # than being hidden. It is advisory and blocks nothing.
+          #
+          # Note: checkov inline `//checkov:skip=` comments do NOT work for the
+          # bicep framework (verified 3.3.9), which is why suppression lives
+          # here rather than next to the resource.
           checkov \
             --directory infra \
             --framework bicep \
+            --skip-check CKV_AZURE_43,CKV_AZURE_59,CKV_AZURE_206 \
             --output sarif \
             --output-file-path . \
             --soft-fail \
