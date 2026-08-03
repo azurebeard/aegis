@@ -1,0 +1,172 @@
+name: Security
+
+# Static security analysis that CodeQL default setup does not cover.
+#
+# Deliberately NOT here:
+#   - Semantic SAST (TypeScript)  -> CodeQL default setup already analyses
+#     javascript-typescript on push/PR + weekly. Adding a CodeQL workflow
+#     would conflict with default setup, not supplement it.
+#   - Workflow analysis           -> CodeQL default setup includes the
+#     `actions` language, which covers .github/workflows.
+#   - npm dependency CVEs         -> Dependabot alerts + the npm entries in
+#     .github/dependabot.yml.
+#
+# Posture: advisory. Findings surface in the Security tab and do not fail the
+# build. A scanner that CRASHES does fail, so a broken scan can never be
+# mistaken for a clean one.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # Rule sets change independently of the code; re-scan an unchanged tree.
+    - cron: "19 4 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write # SARIF upload only
+    env:
+      GITLEAKS_VERSION: "8.30.1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL --retry 3 -o "$tarball" "$base/$tarball"
+          curl -fsSL --retry 3 -o checksums.txt \
+            "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          sha256sum --ignore-missing -c checksums.txt
+          tar -xzf "$tarball" gitleaks
+          install -m 0755 gitleaks /usr/local/bin/gitleaks
+
+      - name: Scan working tree
+        run: |
+          set -uo pipefail
+          # `gitleaks dir` scans the checked-out tree. This is deliberately NOT
+          # the pre-commit hook's invocation: that hook runs
+          # `gitleaks git --pre-commit --staged`, which scans the git index.
+          # A CI checkout has an empty index, so the pre-commit job in ci.yml
+          # scans 0 bytes and passes regardless of content. This job is the
+          # actual CI backstop; the hook remains the commit-time gate locally.
+          gitleaks dir . \
+            --report-format sarif \
+            --report-path gitleaks.sarif \
+            --redact \
+            --exit-code 0
+          rc=$?
+          if [ ! -f gitleaks.sarif ]; then
+            echo "::error::gitleaks produced no SARIF (exit $rc) — operational failure, not a clean result."
+            exit 1
+          fi
+
+      - name: Upload SARIF
+        if: always() && hashFiles('gitleaks.sarif') != ''
+        uses: github/codeql-action/upload-sarif@a2983b8bed1923f44751c5c43237f479442827b3  # v3
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+      - name: Summary
+        if: always()
+        run: |
+          set -euo pipefail
+          count=$(jq '[.runs[].results[]] | length' gitleaks.sarif 2>/dev/null || echo "unknown")
+          {
+            echo "### Secret scan (gitleaks)"
+            echo ""
+            echo "Findings: ${count} — see the Security tab. Values are redacted."
+            echo ""
+            echo "Scope: working tree only. Git history is NOT scanned by this job."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  iac-scan:
+    name: IaC scan (checkov)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      CHECKOV_VERSION: "3.3.9"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Install checkov
+        run: python -m pip install --disable-pip-version-check "checkov==${CHECKOV_VERSION}"
+
+      - name: Scan Bicep
+        run: |
+          set -uo pipefail
+          # Scoped to infra/ and the bicep framework only: the repo has no
+          # Terraform, Kubernetes or Dockerfiles, and github_actions is already
+          # covered by CodeQL's `actions` language. --soft-fail keeps findings
+          # advisory. Note infra/main.json is bicep build output and untracked,
+          # so it is never present in a CI checkout.
+          checkov \
+            --directory infra \
+            --framework bicep \
+            --output sarif \
+            --output-file-path . \
+            --soft-fail \
+            --quiet \
+            --compact
+          rc=$?
+          # checkov writes "results_<format>.sarif", NOT "results.sarif".
+          # Verified against checkov 3.3.9; assert rather than assume, so a
+          # rename upstream surfaces as a loud failure instead of a silent pass.
+          if [ ! -s results_sarif.sarif ]; then
+            echo "::error::checkov produced no SARIF at results_sarif.sarif (exit $rc) — operational failure, not a clean result."
+            ls -la ./*.sarif 2>/dev/null || true
+            exit 1
+          fi
+          mv results_sarif.sarif checkov.sarif
+
+      - name: Upload SARIF
+        if: always() && hashFiles('checkov.sarif') != ''
+        uses: github/codeql-action/upload-sarif@a2983b8bed1923f44751c5c43237f479442827b3  # v3
+        with:
+          sarif_file: checkov.sarif
+          category: checkov-bicep
+
+      - name: Summary
+        if: always()
+        run: |
+          set -euo pipefail
+          count=$(jq '[.runs[].results[]] | length' checkov.sarif 2>/dev/null || echo "unknown")
+          {
+            echo "### IaC scan (checkov, Bicep)"
+            echo ""
+            echo "Findings: ${count} — see the Security tab."
+            echo ""
+            echo "Coverage limit: analyses committed Bicep only. Deployed state and"
+            echo "values supplied at deployment time are not evaluated. Checkov's"
+            echo "Bicep rule coverage is narrower than its Terraform coverage."
+          } >> "$GITHUB_STEP_SUMMARY"

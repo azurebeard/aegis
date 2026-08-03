@@ -178,9 +178,12 @@ describe("renderEmailHtml — share link (§C.22)", () => {
     });
     expect(r.html).toContain(`Link:`);
     // The URL appears at least twice: button href + plain-text link.
-    const matches = r.html.match(new RegExp(SHARE_URL.replace(/\//g, "\\/"), "g"));
-    expect(matches).not.toBeNull();
-    expect(matches!.length).toBeGreaterThanOrEqual(2);
+    // Counted by splitting rather than by regex: SHARE_URL contains '.' and
+    // '/', and hand-escaping only '/' left the pattern matching more than
+    // intended (CodeQL js/incomplete-hostname-regexp, js/incomplete-sanitization).
+    // A literal split needs no escaping and cannot over-match.
+    const occurrences = r.html.split(SHARE_URL).length - 1;
+    expect(occurrences).toBeGreaterThanOrEqual(2);
   });
 
   it("does NOT render a summary line — body directs to the report (§6.3 batch #3)", () => {

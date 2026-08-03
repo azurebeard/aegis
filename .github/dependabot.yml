@@ -14,3 +14,41 @@ updates:
       github-actions:
         patterns:
           - "*"
+
+  # npm workspaces. Dependabot *alerts* were already enabled repository-wide,
+  # but without these entries no fix PRs were ever raised — 16 open advisories
+  # (10 high / 6 medium) had patched versions available and nothing to apply
+  # them. Alerting and updating are separate features; both are needed.
+  #
+  # Security updates are deliberately NOT grouped: they must be reviewable and
+  # mergeable on their own. Only routine dev-dependency bumps are batched, to
+  # keep PR volume manageable across three workspaces.
+  - package-ecosystem: "npm"
+    directory: "/api"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      api-dev-minor:
+        dependency-type: "development"
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "npm"
+    directory: "/web"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      web-dev-minor:
+        dependency-type: "development"
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "npm"
+    directory: "/scripts"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      scripts-dev-minor:
+        dependency-type: "development"
+        update-types: ["minor", "patch"]
