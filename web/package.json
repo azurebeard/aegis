@@ -22,7 +22,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@azure/msal-browser": "^3.30.0",
+    "@azure/msal-browser": "^5.17.3",
     "@azure/msal-react": "^2.2.0",
     "@fluentui/react-components": "^9.56.0",
     "@fluentui/react-icons": "^2.0.267",
