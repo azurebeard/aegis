@@ -32,7 +32,7 @@
     "@microsoft/microsoft-graph-client": "^3.0.7",
     "applicationinsights": "^3.15.1",
     "jose": "^5.10.0",
-    "json-canonicalize": "^1.2.0"
+    "json-canonicalize": "^2.0.0"
   },
   "devDependencies": {
     "@microsoft/microsoft-graph-types": "^2.43.1",
